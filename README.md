@@ -7,7 +7,7 @@
 | Skill 名称 | 功能 | 触发词 |
 |-----------|------|--------|
 | mihomo-update-dat | 更新 mihomo 地址库 | "更新地址库"、"更新 geoip" |
-| mihomo-update-sub | 更新 mihomo 机场订阅 | "更新订阅"、"更新机场" |
+| mihomo-update-sub | 更新 mihomo 机场订阅（订阅+主配置同步），仅日本线路，含备份/验证/回滚 | "更新订阅"、"更新机场"、"更新代理配置" |
 | codex-troubleshoot | 修复 Codex CLI 错误 | "codex 错误"、"修复 codex" |
 
 ## 安装方法

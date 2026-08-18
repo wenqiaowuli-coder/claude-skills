@@ -1,359 +1,245 @@
 ---
 name: mihomo-update-sub
-description: 更新 mihomo 机场订阅配置。当用户提到"更新订阅"、"更新机场"、"更新代理节点"、"更新mihomo订阅"时使用此 skill。
-version: 1.0.0
+description: 更新 mihomo 机场订阅（订阅+主配置同步），含备份、验证、回滚机制。当用户提到"更新机场订阅"、"更新mihomo"、"更新代理配置"、"更新订阅"、"更新机场"、"更新代理节点"、"更新mihomo订阅"时触发。
+version: 2.0.0
 ---
 
-# Mihomo 机场订阅更新
 
-从机场订阅链接拉取最新代理节点配置，替换 mihomo 的 config.yaml。
+# Mihomo 机场订阅完整更新
+
+两步走流程：更新机场订阅 → 同步到主配置（仅日本线路），全程带备份/验证/回滚。
 
 ## 前置条件
 
-- mihomo 已安装并运行
-- 用户提供有效的机场订阅链接（通常为 `https://xxx.com/api/v1/client/subscribe?token=xxx` 格式）
-- Python3 可用（用于解析订阅内容）
+- mihomo 已安装并以 systemd 用户服务运行（`mihomo.service`）
+- 订阅脚本：`~/.config/mihomo/scripts/update-yfjc-sub.sh`
+- 配置同步脚本：`~/.config/mihomo/scripts/sync-config.py`
+- 主配置：`~/.config/mihomo/config.yaml`
+- 代理提供者：`~/.config/mihomo/proxy-providers/yfjc.yaml`
+- Python3 + PyYAML 可用
+
+## 架构说明
+
+```
+~/.config/mihomo/
+├── config.yaml              # 主配置（DNS、规则、代理组、TUN）
+├── proxy-providers/
+│   └── yfjc.yaml            # 机场订阅节点（由脚本更新）
+├── scripts/
+│   ├── update-yfjc-sub.sh   # 订阅更新脚本
+│   └── sync-config.py       # 配置同步脚本
+└── backup/                  # 自动备份目录
+```
 
 ## 执行步骤
 
-### 第 1 步：确认订阅链接
-
-向用户确认订阅链接。当前系统使用的订阅链接格式示例：
-```
-https://login.yfjc.xyz/api/v1/client/subscribe?token=xxx
-```
-
-如果用户未提供，询问订阅链接。
-
-### 第 2 步：下载订阅内容
+### 第 1 步：更新订阅
 
 ```bash
-# 将 <订阅链接> 替换为实际链接
-curl -sL "<订阅链接>" -o /tmp/subscription.txt
-
-# 检查下载结果
-wc -c /tmp/subscription.txt
+bash ~/.config/mihomo/scripts/update-yfjc-sub.sh
 ```
 
-正常内容应为 base64 编码的文本，文件大小通常在 10-50KB。
+脚本自动完成：下载订阅 → Base64 解码 → 转 YAML → 备份 → 写入 `proxy-providers/yfjc.yaml` → 重启 mihomo → 验证代理。
 
-### 第 3 步：解码并检查格式
+回滚：若 mihomo 重启失败，自动恢复最新备份的 `yfjc.yaml`。
+
+### 第 2 步：同步到主配置
 
 ```bash
-# 解码订阅内容
-base64 -d /tmp/subscription.txt > /tmp/subscription_decoded.txt
-
-# 查看前几行，确认格式
-head -5 /tmp/subscription_decoded.txt
+python3 ~/.config/mihomo/scripts/sync-config.py
 ```
 
-常见的协议格式：
-- `hysteria2://password@server:port/?params#name`
-- `vless://uuid@server:port?params#name`
-- `ss://...`（Shadowsocks）
-- `trojan://...`（Trojan）
+脚本自动完成：
+1. **备份**：`config.yaml` → `backup/config.yaml.bak.<timestamp>`
+2. **清理**：移除 proxies 段中的无效条目（防御性清理）
+3. **读取节点**：从 `proxy-providers/yfjc.yaml` 读取所有节点
+4. **过滤**：排除流量/到期/重置等非节点信息条目 + 黑名单节点
+5. **筛选**：**仅保留 🇯🇵 日本节点**，丢弃其他所有区域
+6. **修复字段**：`skip-cert-verify: true`（所有节点，兼容 legacy CN 证书）、`client-fingerprint` 转换、`tls: true`（Reality 节点）
+7. **重建 proxies**：写入有效节点
+8. **重建 proxy-groups**：
+   - `日本-Hysteria2` 组：url-test，所有日本 hysteria2 节点（5个）
+   - `VLESS-Reality` 组：url-test，所有日本 VLESS Reality 节点（9个）
+   - `VLESS-CF` 组：url-test，所有日本 VLESS CF-Warp 节点（6个）
+   - `日本专线` 组：fallback，`日本-Hysteria2` → `VLESS-Reality` → `VLESS-CF`（故障自动降级）
+9. **修正规则**：自动将引用不存在组的规则改为 `日本专线`
+10. **保留**：DNS、tun 等原有配置
+11. **验证**：`mihomo -t` 检查配置语法
+12. **重启**：`systemctl --user restart mihomo`
+13. **连通性**：测试 YouTube/Google 可访问性
 
-### 第 4 步：转换订阅为 mihomo YAML
+回滚：任何步骤失败 → 恢复 `backup/config.yaml.bak.<timestamp>` → 重启 mihomo。
 
-使用 Python 脚本解析订阅 URI 并生成 mihomo 配置：
+## 订阅链接
 
-```bash
-cat << 'PYEOF' > /tmp/gen_config.py
-import base64
-import urllib.parse
-import yaml
-import sys
+当前使用的订阅链接（硬编码在 `update-yfjc-sub.sh` 中）：
 
-with open('/tmp/subscription.txt', 'r') as f:
-    content = f.read().strip()
-
-try:
-    decoded = base64.b64decode(content).decode('utf-8')
-except:
-    decoded = content
-
-lines = [l.strip() for l in decoded.split('\n') if l.strip()]
-print(f"共解析到 {len(lines)} 个节点", file=sys.stderr)
-
-proxies = []
-proxy_names = []
-
-for line in lines:
-    try:
-        if line.startswith('hysteria2://'):
-            rest = line[len('hysteria2://'):]
-            password_part, rest = rest.split('@', 1)
-            password = urllib.parse.unquote(password_part)
-            
-            if '?' in rest:
-                server_port, params = rest.split('?', 1)
-                if '#' in params:
-                    params, frag = params.split('#', 1)
-                    frag = urllib.parse.unquote(frag)
-                else:
-                    frag = ''
-            else:
-                server_port = rest
-                params = ''
-                frag = ''
-            
-            server_port = server_port.rstrip('/')
-            server, port = server_port.rsplit(':', 1)
-            port = int(port)
-            
-            qs = urllib.parse.parse_qs(params)
-            sni = qs.get('sni', [''])[0]
-            insecure = qs.get('insecure', ['false'])[0] in ('true', '1')
-            pin_sha256 = qs.get('pinSHA256', [''])[0]
-            mport = qs.get('mport', [''])[0]
-            
-            proxy = {
-                'name': frag if frag else f'{server}:{port}',
-                'type': 'hysteria2',
-                'server': server,
-                'port': port,
-                'password': password,
-                'sni': sni,
-                'skip-cert-verify': insecure,
-            }
-            if pin_sha256:
-                proxy['pin-sh256'] = pin_sha256
-            if mport:
-                proxy['mport'] = mport
-            
-            proxies.append(proxy)
-            proxy_names.append(proxy['name'])
-        
-        elif line.startswith('vless://'):
-            rest = line[len('vless://'):]
-            uuid_part, rest = rest.split('@', 1)
-            uuid = urllib.parse.unquote(uuid_part)
-            
-            if '?' in rest:
-                server_port, params = rest.split('?', 1)
-                frag = ''
-                if '#' in params:
-                    params, frag = params.split('#', 1)
-                    frag = urllib.parse.unquote(frag)
-            else:
-                server_port = rest
-                params = ''
-                frag = ''
-            
-            server_port = server_port.rstrip('/')
-            server, port = server_port.rsplit(':', 1)
-            port = int(port)
-            
-            qs = urllib.parse.parse_qs(params)
-            sni = qs.get('sni', [''])[0]
-            insecure = qs.get('insecure', ['false'])[0] in ('true', '1')
-            pin_sha256 = qs.get('pinSHA256', [''])[0]
-            flow = qs.get('flow', ['xtls-rprx-vision'])[0]
-            network = qs.get('type', [''])[0] or qs.get('network', [''])[0]
-            ws_path = qs.get('path', [''])[0]
-            ws_host = qs.get('host', [''])[0] or qs.get('sni', [''])[0]
-            
-            proxy = {
-                'name': frag if frag else f'{server}:{port}',
-                'type': 'vless',
-                'server': server,
-                'port': port,
-                'uuid': uuid,
-                'tls': True,
-                'servername': sni,
-                'flow': flow,
-                'skip-cert-verify': insecure,
-            }
-            if pin_sha256:
-                proxy['pin-sh256'] = pin_sha256
-            if network == 'ws':
-                proxy['network'] = 'ws'
-                if ws_path:
-                    proxy['ws-opts'] = {
-                        'path': ws_path,
-                        'headers': {'Host': ws_host} if ws_host else {}
-                    }
-            
-            proxies.append(proxy)
-            proxy_names.append(proxy['name'])
-    except Exception as e:
-        print(f"跳过: {line[:80]}... 错误: {e}", file=sys.stderr)
-
-# 读取现有配置以保留自定义设置
-with open('/home/wq/.config/mihomo/config.yaml', 'r') as f:
-    old_config = yaml.safe_load(f)
-
-# 保留原有的 DNS、规则、代理组等配置
-proxy_groups = old_config.get('proxy-groups', [])
-rules = old_config.get('rules', [])
-
-# 重建代理组，使用新节点
-new_groups = []
-for group in proxy_groups:
-    if group.get('name') == '一分机场':
-        group['proxies'] = proxy_names
-        new_groups.append(group)
-    elif group.get('name') in ['日本自动选择', '日本故障转移']:
-        group['proxies'] = proxy_names
-        new_groups.append(group)
-    else:
-        # 保留其他代理组但更新节点列表
-        group['proxies'] = proxy_names
-        new_groups.append(group)
-
-# 去重代理组名称
-seen = set()
-unique_groups = []
-for group in new_groups:
-    name = group.get('name')
-    if name not in seen:
-        seen.add(name)
-        unique_groups.append(group)
-
-# 更新规则中的代理组引用
-for i, rule in enumerate(rules):
-    rules[i] = rule.replace('一分机场', '日本专线')
-
-# 构建新配置
-config = {
-    'allow-lan': old_config.get('allow-lan', False),
-    'bind-address': old_config.get('bind-address', '*'),
-    'dns': old_config.get('dns', {}),
-    'geoip-dat-url': old_config.get('geoip-dat-url', 'https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.dat'),
-    'geosite-dat-url': old_config.get('geosite-dat-url', 'https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite.dat'),
-    'ipv6': old_config.get('ipv6', True),
-    'log-level': old_config.get('log-level', 'info'),
-    'mixed-port': old_config.get('mixed-port', 7897),
-    'mode': old_config.get('mode', 'rule'),
-    'profile': old_config.get('profile', {'store-selected': True}),
-    'proxies': proxies,
-    'proxy-groups': unique_groups,
-    'rules': rules,
-    'tcp-concurrent': old_config.get('tcp-concurrent', True),
-    'tun': old_config.get('tun', {
-        'auto-detect-interface': True,
-        'auto-route': True,
-        'dns-hijack': ['any:53'],
-        'enable': True,
-        'stack': 'system',
-        'strict-route': False,
-    }),
-    'unified-delay': old_config.get('unified-delay', True),
-}
-
-with open('/home/wq/.config/mihomo/config.yaml', 'w') as f:
-    yaml.dump(config, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
-
-print(f"✅ 成功生成 {len(proxies)} 个节点", file=sys.stderr)
-PYEOF
-
-python3 /tmp/gen_config.py
+```
+https://login.yfjc.xyz/api/v1/client/subscribe?token=726442ed2b7c4b4813cb5a24acea962e
 ```
 
-检查生成的配置：
-```bash
-grep "name:" /home/wq/.config/mihomo/config.yaml | head -20
-```
-
-### 第 5 步：备份当前配置
-
-```bash
-cp /home/wq/.config/mihomo/config.yaml /home/wq/.config/mihomo/config.yaml.bak
-```
-
-### 第 6 步：验证配置合法性
-
-```bash
-/home/wq/.local/bin/mihomo -d /home/wq/.config/mihomo/ -f /home/wq/.config/mihomo/config.yaml -t 2>&1 | grep -E "test is successful|Parse config error"
-```
-
-如果显示 `test is successful`，继续下一步。否则停止并报告错误。
-
-### 第 7 步：重启 mihomo
-
-```bash
-kill $(pgrep mihomo) 2>/dev/null
-sleep 3
-nohup /home/wq/.local/bin/mihomo -d /home/wq/.config/mihomo/ -f /home/wq/.config/mihomo/config.yaml > /tmp/mihomo_sub_update.log 2>&1 &
-sleep 5
-```
-
-### 第 8 步：验证服务
-
-```bash
-# 检查端口
-ss -tlnp | grep 7897
-
-# 测试代理
-curl -s -o /dev/null -w "代理测试: HTTP %{http_code} | %{time_total}s\n" https://www.google.com --proxy http://127.0.0.1:7897 --connect-timeout 10
-```
-
-### 第 9 步：回滚机制
-
-如果服务启动失败或代理测试失败，立即回滚：
-
-```bash
-# 恢复备份
-cp /home/wq/.config/mihomo/config.yaml.bak /home/wq/.config/mihomo/config.yaml
-
-# 重启服务
-kill $(pgrep mihomo) 2>/dev/null
-sleep 2
-nohup /home/wq/.local/bin/mihomo -d /home/wq/.config/mihomo/ -f /home/wq/.config/mihomo/config.yaml > /dev/null 2>&1 &
-sleep 5
-
-# 验证
-ss -tlnp | grep 7897
-curl -s -o /dev/null -w "回滚后代理测试: HTTP %{http_code} | %{time_total}s\n" https://www.google.com --proxy http://127.0.0.1:7897 --connect-timeout 10
-```
-
-### 第 10 步：清理
-
-验证成功后，删除临时文件和备份：
-
-```bash
-rm -f /home/wq/.config/mihomo/config.yaml.bak
-rm -f /tmp/subscription.txt /tmp/subscription_decoded.txt /tmp/gen_config.py /tmp/mihomo_sub_update.log
-```
-
-## 注意事项
-
-1. **订阅链接安全**：订阅链接包含敏感 token，不要在日志或文档中暴露完整链接
-2. **节点去重**：转换脚本会自动去重代理组名称
-3. **保留自定义配置**：脚本会保留原有的 DNS、规则、TUN 等配置
-4. **协议兼容性**：
-   - Hysteria2 节点：需要确保 `skip-cert-verify` 设置正确
-   - VLESS Reality 节点：可能需要特殊的 TLS 配置
-5. **备份重要性**：更新前必须备份，以便回滚
+如需更换订阅链接，直接修改脚本中的 `SUB_URL` 变量。
 
 ## 输出格式
 
 更新完成后，向用户报告：
 - 订阅链接（部分脱敏）
 - 解析到的节点总数
-- 保留的自定义配置（DNS、规则等）
+- 节点协议分布（Hysteria2 / VLESS）
+- 备份文件路径
 - 服务状态
 - 代理测试结果
 
-## 常见问题处理
+## 节点筛选规则
 
-### 订阅解析失败
+同步脚本通过 `KEEP_REGIONS` 和 `NODE_BLACKLIST` 控制。
 
-如果订阅内容无法解析：
-1. 检查订阅链接是否有效
-2. 确认订阅内容格式（base64 编码）
-3. 查看错误日志
+### KEEP_REGIONS
+仅保留指定区域的节点，当前：
+```python
+KEEP_REGIONS = {"日本专线"}
+```
 
-### 节点全部失效
+| 筛选条件 | 处理方式 |
+|----------|----------|
+| 🇯🇵 日本节点 | ✅ 保留 |
+| 🇺🇸🇸🇬🇹🇼🇬🇧🇳🇱🇫🇷🇩🇪🇧🇷🇰🇷 等其他区域 | ❌ 丢弃 |
+| 剩余流量/套餐到期/距离下次重置 | ❌ 丢弃（非节点信息） |
 
-如果更新后所有节点都无法连接：
+### NODE_BLACKLIST
+排除已知不稳定或高延迟的节点，当前：
+```python
+NODE_BLACKLIST = {"🇯🇵日本专线5-0.1倍率"}
+```
+
+如需恢复黑名单中的节点，从 `NODE_BLACKLIST` 中删除后重新同步即可。
+
+## 代理组路由架构
+
+### 组结构
+```
+规则 (google.com/youtube.com/github.com ...)
+  → 日本专线 (fallback)
+    1. 日本-Hysteria2 (url-test: 5 个 hysteria2 节点，可测真实延迟，默认优先)
+    2. VLESS-Reality (url-test: 9 个 Reality 节点，延迟显示 0ms，Hysteria2 故障时降级)
+    3. VLESS-CF (url-test: 6 个 CF-Warp 节点，前两者都故障时降级)
+    → 全部失败 → DIRECT (直连)
+```
+
+### 设计原则
+- **协议分层**：按协议类型拆分节点组（Hysteria2 / VLESS-Reality / VLESS-CF），避免不同特性的节点混在同一组内测速。
+- **组引用优于个体节点**：`日本专线` 引用 3 个子组名，而非直接列出所有 20 个节点。避免 url-test 对不可测延迟的 Reality 节点反复超时。
+- **fallback 容灾**：`日本专线` 使用 fallback 模式，优先使用 Hysteria2，故障时自动降级到 Reality，再故障降级到 CF-Warp。
+
+## 节点兼容性修复
+
+同步脚本自动处理以下兼容性问题：
+
+| 问题 | 修复方式 |
+|------|----------|
+| Go 1.26 拒绝 legacy CN 证书 | 所有节点 `skip-cert-verify: true` |
+| mihomo v1.19+ `fingerprint` 字段变更 | 自动转为 `client-fingerprint` |
+| VLESS Reality 节点缺少 `tls` | 自动添加 `tls: true` |
+| proxies 段混入代理组名等无效条目 | 自动清理（需 `type` + `server` 字段） |
+
+## systemd 服务优化
+
+`mihomo.service` 已配置端口释放延迟，避免重启时端口冲突：
+
+```ini
+[Service]
+Type=simple
+ExecStart=/home/wq/.local/bin/mihomo -d /home/wq/.config/mihomo/ -f /home/wq/.config/mihomo/config.yaml
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=5
+ExecStopPost=/bin/sleep 1
+```
+
+修改后需执行 `systemctl --user daemon-reload` 生效。
+
+## 验证结果
+
+完成后检查：
+
+```bash
+# 服务状态
+systemctl --user status mihomo
+
+# 连通性
+export http_proxy=http://127.0.0.1:7890
+curl -s -o /dev/null -w "%{http_code}\n" https://www.youtube.com
+```
+
+## 日志文件
+
+| 文件 | 用途 |
+|------|------|
+| `~/.config/mihomo/logs/yfjc-update.log` | 订阅更新日志 |
+| `~/.config/mihomo/logs/sync-config.log` | 配置同步日志 |
+
+## 备份文件
+
+- `~/.config/mihomo/backup/yfjc.yaml.bak.<timestamp>` — 订阅备份
+- `~/.config/mihomo/backup/config.yaml.bak.<timestamp>` — 主配置备份
+
+## 当前保留线路
+
+同步完成后，config.yaml 中包含：
+
+| 代理组 | 模式 | 节点数 | 说明 |
+|--------|------|--------|------|
+| 日本-Hysteria2 | url-test | 5 | hysteria2 专线节点（-0.1倍率） |
+| VLESS-Reality | url-test | 9 | VLESS Reality 节点（移动专属/通用） |
+| VLESS-CF | url-test | 6 | VLESS CF-Warp 节点（日本1-6号） |
+| 日本专线 | fallback | 3 | → Hysteria2 → VLESS-Reality → VLESS-CF |
+
+## 常见问题
+
+**订阅解析失败**：
+1. 检查订阅链接是否有效（可浏览器访问）
+2. 查看脚本日志：`~/.config/mihomo/logs/yfjc-update.log`
+3. 手动下载检查：`curl -sL <订阅链接> | base64 -d | head -5`
+
+**节点全部失效**：
 1. 检查 `skip-cert-verify` 设置
-2. 确认节点协议类型（Hysteria2/VLESS）
+2. 确认节点协议类型和参数
 3. 联系机场客服确认节点状态
 
-### 配置冲突
+**mihomo 启动失败**：
+1. 检查配置语法：`mihomo -t`
+2. 查看 systemd 日志：`journalctl --user -u mihomo -n 30`
+3. 常见错误：
+   - `invalid REALITY short id`：short-id 格式错误，应为纯十六进制
+   - `duplicate name`：节点名称重复，需确保唯一
+   - `bind: address already in use`：端口被占用
 
-如果出现配置冲突：
-1. 保留原有配置的 DNS、规则部分
-2. 只替换 proxies 和 proxy-groups
-3. 手动合并冲突的设置项
+**配置冲突**：如果手动修改了 `config.yaml`，更新订阅时注意：
+- `proxy-providers/yfjc.yaml` 不受影响
+- 手动同步节点到 `config.yaml` 时会覆盖原有节点列表
+- DNS、规则、TUN 等配置会保留
+
+**YAML 中 emoji 显示为 `\U0001F1EF`**：正常现象，YAML 的 Unicode 转义，mihomo 能正确解析。
+
+**需要恢复其他区域节点**：修改 `sync-config.py` 中的 `KEEP_REGIONS` 后重新同步。
+
+**新增日本节点不显示**：先更新订阅，再运行同步脚本即可。
+
+**hysteria2 服务器不可达**：订阅更新后服务器地址可能变更。如果所有 hysteria2 节点都不可达，检查 `日本-Hysteria2` 组是否全部超时。如果全部失效，可能需要等待机场恢复或手动切换节点。
+
+**VLESS Reality 节点不可用**：Reality 节点的 url-test 延迟显示为 0ms，这是正常的（mihomo 无法对 Reality 协议做延迟测试）。如果 Reality 节点全部失败，通常是服务器端证书或网络问题，需等待机场修复。
+
+**VLESS-CF 节点不可用**：CF-Warp 节点走 Cloudflare 边缘，延迟通常较高。如果该组全部失败，可能是 Cloudflare 节点被墙，可暂时从 `VLESS-CF` 组中移除该节点。
+
+**故障自动降级**：`日本专线` 使用 fallback 模式，默认优先 Hysteria2。如果 Hysteria2 故障，自动降级到 VLESS-Reality；如果 Reality 也故障，再降级到 VLESS-CF。
+
+## 相关文件
+
+| 文件 | 说明 |
+|------|------|
+| `~/.config/mihomo/scripts/update-yfjc-sub.sh` | 订阅更新脚本 |
+| `~/.config/mihomo/scripts/sync-config.py` | 配置同步脚本 |
+| `~/.config/mihomo/config.yaml` | 主配置文件 |
+| `~/.config/mihomo/proxy-providers/yfjc.yaml` | 机场订阅节点 |
+| `~/.config/mihomo/backup/` | 备份目录 |
+| `~/.config/systemd/user/mihomo.service` | systemd 服务配置（含端口释放延迟） |
