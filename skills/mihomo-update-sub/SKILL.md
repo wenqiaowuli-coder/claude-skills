@@ -75,7 +75,7 @@ python3 ~/.config/mihomo/scripts/sync-config.py
 当前使用的订阅链接（硬编码在 `update-yfjc-sub.sh` 中）：
 
 ```
-https://login.yfjc.xyz/api/v1/client/subscribe?token=726442ed2b7c4b4813cb5a24acea962e
+https://login.yfjc.xyz/api/v1/client/subscribe?token=<YOUR_TOKEN>
 ```
 
 如需更换订阅链接，直接修改脚本中的 `SUB_URL` 变量。
